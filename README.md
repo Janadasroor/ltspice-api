@@ -4,9 +4,14 @@ Python library + FastAPI REST API + Telegram bot for automating LTspice simulati
 
 ## Quick Start
 
-```bash
-pip install -r requirements.txt
-set TELEGRAM_BOT_TOKEN=your_token_here
+```powershell
+# Auto-detect LTspice, install deps, create .env
+.\setup.ps1
+
+# Add your bot token (or skip for API-only mode)
+notepad .env
+
+# Start server
 python -m uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
