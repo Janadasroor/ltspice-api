@@ -1,6 +1,8 @@
 import uuid
 import os
 import re
+import math
+import shutil
 import tempfile
 import threading
 from pathlib import Path, PureWindowsPath
@@ -24,6 +26,70 @@ from . import telegram_bot
 # Ephemeral work directory — no local paths exposed to clients
 WORK_DIR = Path(tempfile.mkdtemp(prefix="ltspice_api_"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+# Persistent library storage for uploaded .lib/.sub files
+LIB_DIR = Path(tempfile.mkdtemp(prefix="ltspice_libs_"))
+LIB_DIR.mkdir(parents=True, exist_ok=True)
+
+# Persistent symbol storage for uploaded .asy files
+SYM_DIR = Path(tempfile.mkdtemp(prefix="ltspice_sym_"))
+SYM_DIR.mkdir(parents=True, exist_ok=True)
+
+# LTspice help extracted HTML files
+HELP_DIR = Path(r"C:\Users\js\AppData\Local\Temp\opencode\ltspice_help")
+# Persistent custom documentation / agent memory
+CUSTOM_DOC_DIR = Path(os.path.expanduser("~")) / ".gemini" / "ltspice_api" / "custom_docs"
+CUSTOM_DOC_DIR.mkdir(parents=True, exist_ok=True)
+
+_HELP_INDEX: Dict[str, Dict[str, Any]] = {}  # filename -> {title, content, type}
+
+
+def _build_help_index():
+    _HELP_INDEX.clear()
+    # 1. Official Help
+    html_dir = HELP_DIR / "html"
+    if html_dir.exists():
+        for f in sorted(html_dir.iterdir()):
+            if f.suffix.lower() in (".htm", ".html"):
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace")
+                    title = ""
+                    m = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE)
+                    if m:
+                        title = m.group(1).strip()
+                    # Strip HTML tags for searchable text
+                    plain = re.sub(r"<[^>]+>", " ", text)
+                    plain = re.sub(r"\s+", " ", plain).strip()
+                    _HELP_INDEX[f.stem] = {
+                        "title": title or f.stem,
+                        "content": plain,
+                        "filename": f.name,
+                        "type": "official"
+                    }
+                except Exception:
+                    pass
+
+    # 2. Custom docs (Agent Memory)
+    if CUSTOM_DOC_DIR.exists():
+        for f in sorted(CUSTOM_DOC_DIR.iterdir()):
+            if f.suffix.lower() == ".md":
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                    title = f.stem
+                    lines = content.splitlines()
+                    if lines and lines[0].startswith("#"):
+                        title = lines[0].lstrip("#").strip()
+                    _HELP_INDEX[f.stem] = {
+                        "title": title,
+                        "content": content,
+                        "filename": f.name,
+                        "type": "custom"
+                    }
+                except Exception:
+                    pass
+
+
+_build_help_index()
 
 # Track temp dirs we create for cleanup
 _temp_dirs: Set[str] = set()
@@ -97,6 +163,28 @@ class SimulateResponse(BaseModel):
     id: str
     status: str
     message: str
+
+class LibUploadRequest(BaseModel):
+    filename: str = Field(description="Library filename (e.g. 'mylib.lib')")
+    content: str = Field(description="File content")
+
+class LibUploadResponse(BaseModel):
+    filename: str
+    path: str
+    message: str
+
+class SymUploadRequest(BaseModel):
+    filename: str = Field(description="Symbol filename (e.g. 'my_opamp.asy')")
+    content: str = Field(description="File content")
+
+class SymUploadResponse(BaseModel):
+    filename: str
+    path: str
+    message: str
+
+class HelpTopicRequest(BaseModel):
+    name: str = Field(description="Topic name (slug, e.g. 'lesson_learned_1')")
+    content: str = Field(description="Markdown content (should include a # Title)")
 
 # ---------------------------------------------------------------------------
 # Component type → Circuit method mapping
@@ -253,6 +341,37 @@ async def help():
     }
 
 
+@app.post("/library")
+async def upload_library(req: LibUploadRequest):
+    name = req.filename.strip()
+    # Sanitize — allow only safe filenames
+    if not re.match(r'^[\w.-]+$', name):
+        raise HTTPException(400, f"Invalid filename: {name}")
+    path = LIB_DIR / name
+    path.write_text(req.content)
+    return LibUploadResponse(filename=name, path=_strip_paths(str(path)), message="Library saved")
+
+
+@app.post("/symbol")
+async def upload_symbol(req: SymUploadRequest):
+    name = req.filename.strip()
+    if not re.match(r'^[\w.-]+$', name):
+        raise HTTPException(400, f"Invalid filename: {name}")
+    path = SYM_DIR / name
+    path.write_text(req.content)
+    return SymUploadResponse(filename=name, path=_strip_paths(str(path)), message="Symbol saved")
+
+
+@app.get("/symbol/{filename}", response_class=PlainTextResponse)
+async def get_symbol(filename: str):
+    if not re.match(r'^[\w.-]+$', filename):
+        raise HTTPException(400, f"Invalid filename: {filename}")
+    path = SYM_DIR / filename
+    if not path.exists():
+        raise HTTPException(404, f"Symbol '{filename}' not found")
+    return path.read_text()
+
+
 @app.post("/netlist", response_class=PlainTextResponse)
 async def netlist_from_circuit(defn: CircuitDef):
     cir = _build_circuit(defn)
@@ -263,6 +382,10 @@ async def netlist_from_circuit(defn: CircuitDef):
 async def simulate(req: SimulateRequest):
     sim_id = uuid.uuid4().hex[:12]
     netlist_store[sim_id] = req.netlist
+    # Copy uploaded libraries into work dir so LTspice can find them
+    for f in LIB_DIR.iterdir():
+        if f.is_file():
+            shutil.copy2(f, WORK_DIR / f.name)
     try:
         result = _run_netlist(
             req.netlist,
@@ -325,6 +448,18 @@ async def simulate_circuit(defn: CircuitDef):
     return SimulateResponse(id=sim_id, status=status, message=msg)
 
 
+def _sanitize_numeric(v: Any) -> Any:
+    """Replace inf/nan with None so JSON serialization doesn't 500."""
+    if isinstance(v, float):
+        if math.isinf(v) or math.isnan(v):
+            return None
+    return v
+
+
+def _sanitize_list_numeric(lst: list) -> list:
+    return [_sanitize_numeric(x) for x in lst]
+
+
 def _get_result(sim_id: str) -> SimulationResult:
     r = results_store.get(sim_id)
     if r is None:
@@ -371,15 +506,15 @@ async def get_data(sim_id: str, var: Optional[str] = Query(None)):
             raise HTTPException(404, f"Variable '{var}' not found")
         return {
             "variable": var,
-            "time": r.raw.time.tolist() if r.raw.time is not None else None,
-            "data": data.tolist(),
+            "time": _sanitize_list_numeric(r.raw.time.tolist()) if r.raw.time is not None else None,
+            "data": _sanitize_list_numeric(data.tolist()),
             "unit": next((v.get("unit", "") for v in r.raw.variables if v["name"] == var), ""),
         }
     result: Dict[str, Any] = {}
     if r.raw.time is not None:
-        result["time"] = r.raw.time.tolist()
+        result["time"] = _sanitize_list_numeric(r.raw.time.tolist())
     for name, vals in r.raw.values.items():
-        result[name] = vals.tolist()
+        result[name] = _sanitize_list_numeric(vals.tolist())
     return result
 
 
@@ -392,9 +527,9 @@ async def get_fft(sim_id: str, var: str = Query(...), window: str = Query("hanni
         raise HTTPException(400, str(e))
     return {
         "variable": var,
-        "freq": fft_data["freq"].tolist(),
-        "mag": fft_data["mag"].tolist(),
-        "phase": fft_data["phase"].tolist(),
+        "freq": _sanitize_list_numeric(fft_data["freq"].tolist()),
+        "mag": _sanitize_list_numeric(fft_data["mag"].tolist()),
+        "phase": _sanitize_list_numeric(fft_data["phase"].tolist()),
         "fs": fft_data["fs"],
         "n": fft_data["n"],
     }
@@ -438,3 +573,66 @@ async def delete_result(sim_id: str):
     for f in WORK_DIR.glob(f"{sim_id}.*"):
         f.unlink(missing_ok=True)
     return {"status": "deleted", "id": sim_id}
+
+
+# ---------------------------------------------------------------------------
+# Help endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/help/search")
+async def help_search(q: str = Query(..., description="Search query")):
+    q = q.lower()
+    results = []
+    for stem, info in _HELP_INDEX.items():
+        searchable = f"{info['title']} {stem} {info['content']}".lower()
+        if q in searchable:
+            # Create a snippet around the match
+            idx = info["content"].lower().find(q)
+            start = max(0, idx - 60)
+            end = min(len(info["content"]), idx + len(q) + 120)
+            snippet = info["content"][start:end]
+            if start > 0:
+                snippet = "..." + snippet
+            if end < len(info["content"]):
+                snippet = snippet + "..."
+            results.append({
+                "topic": stem,
+                "title": info["title"],
+                "type": info.get("type", "official"),
+                "snippet": snippet,
+            })
+    return {"query": q, "count": len(results), "results": results}
+
+
+@app.get("/help/topic")
+async def help_topic(name: str = Query(..., description="Topic name (filename without extension)")):
+    info = _HELP_INDEX.get(name)
+    if info is None:
+        raise HTTPException(404, f"Help topic '{name}' not found")
+    
+    if info.get("type") == "custom":
+        path = CUSTOM_DOC_DIR / info["filename"]
+    else:
+        path = HELP_DIR / "html" / info["filename"]
+        
+    if not path.exists():
+        raise HTTPException(404, f"Help file not found")
+    return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace"))
+
+
+@app.post("/help/topic")
+async def save_help_topic(req: HelpTopicRequest):
+    # Sanitize name - alphanumeric and underscores/dashes only
+    name = re.sub(r'[^\w\-]', '_', req.name).strip("_")
+    if not name:
+        raise HTTPException(400, "Invalid topic name")
+    
+    filename = f"{name}.md"
+    path = CUSTOM_DOC_DIR / filename
+    path.write_text(req.content, encoding="utf-8")
+    
+    # Refresh index
+    _build_help_index()
+    
+    return {"status": "saved", "topic": name, "filename": filename}

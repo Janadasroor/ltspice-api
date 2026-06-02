@@ -67,6 +67,61 @@ if (-not (Test-Path $envFile)) {
     Write-Host ".env already exists, skipping" -ForegroundColor Yellow
 }
 
+# --- Install MCP ---
+$mcpDir = Join-Path $PSScriptRoot "ltspice-mcp"
+if (Test-Path $mcpDir) {
+    Write-Host "Installing LTspice MCP package..." -ForegroundColor Yellow
+    python -m pip install -e $mcpDir
+    if ($LASTEXITCODE -eq 0) {
+        # Find the actual executable path
+        $mcpExe = Join-Path $env:APPDATA "Python\Python313\Scripts\ltspice-mcp.exe"
+        if (-not (Test-Path $mcpExe)) {
+            $mcpExe = (Get-Command ltspice-mcp -ErrorAction SilentlyContinue).Source
+        }
+        
+        if ($mcpExe) {
+            Write-Host "Configuring AI Agents..." -ForegroundColor Cyan
+            
+            # 1. Gemini CLI
+            if (Get-Command gemini -ErrorAction SilentlyContinue) {
+                Write-Host "  -> Registering with Gemini CLI (User Scope)..." -ForegroundColor Gray
+                gemini mcp add --scope user --trust ltspice-mcp $mcpExe --api-url http://127.0.0.1:8000
+            }
+
+            # 2. Codex Agent
+            if (Get-Command codex -ErrorAction SilentlyContinue) {
+                Write-Host "  -> Registering with Codex Agent..." -ForegroundColor Gray
+                codex mcp add ltspice-mcp $mcpExe -- --api-url http://127.0.0.1:8000
+            }
+
+            # 3. Claude Desktop
+            $claudeConfig = Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
+            if (Test-Path (Split-Path $claudeConfig)) {
+                Write-Host "  -> Registering with Claude Desktop..." -ForegroundColor Gray
+                if (-not (Test-Path $claudeConfig)) {
+                    '{"mcpServers": {}}' | Out-File -FilePath $claudeConfig -Encoding utf8
+                }
+                $configJson = Get-Content $claudeConfig | ConvertFrom-Json
+                if (-not $configJson.mcpServers) { $configJson | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} }
+                
+                $mcpEntry = @{
+                    command = $mcpExe
+                    args = @("--api-url", "http://127.0.0.1:8000")
+                }
+                
+                if ($configJson.mcpServers.PSObject.Properties["ltspice-mcp"]) {
+                    $configJson.mcpServers."ltspice-mcp" = $mcpEntry
+                } else {
+                    $configJson.mcpServers | Add-Member -MemberType NoteProperty -Name "ltspice-mcp" -Value $mcpEntry
+                }
+                $configJson | ConvertTo-Json -Depth 10 | Out-File -FilePath $claudeConfig -Encoding utf8
+            }
+        } else {
+            Write-Host "WARNING: ltspice-mcp executable not found. Manual registration may be required." -ForegroundColor Yellow
+        }
+    }
+}
+
 # --- Verify ---
 Write-Host ""
 Write-Host "=== Verification ===" -ForegroundColor Cyan

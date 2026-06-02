@@ -55,12 +55,14 @@ class SimulationResult:
 
     def _parse_log(self):
         self.log_text = self.log_path.read_text(encoding="latin-1", errors="replace")
+        # print(f"Parsing log: {self.log_path}, len={len(self.log_text)}")
         in_files_loaded = False
         for line in self.log_text.split("\n"):
             line_raw = line  # keep original for error parsing
             line = line.strip()
             if not line:
                 continue
+            # print(f"Processing line: {line}")
             # Extract error messages from log (e.g. "broken.net(2): This sub-circuit name is not defined.")
             if (("):" in line or line.startswith("[path]") or line.startswith("/")) and
                 any(kw in line.lower() for kw in ("error", "not defined", "invalid", "unknown", "syntax", "failed", "can't", "expected", "unexpected"))):
@@ -102,30 +104,60 @@ class SimulationResult:
                 in_files_loaded = False
 
             # Parse .meas results from log
-            if ".meas" in line.lower() or ("\t" in line and any(c.isdigit() for c in line[:5])):
+            if ".meas" in line.lower() or ":" in line or "=" in line:
+                # Skip simulation metadata lines
+                if any(line.startswith(x) for x in ("solver =", "tnom =", "temp =", "method =", "Total elapsed time:", "Start Time:", "Circuit:", "LTspice")):
+                    continue
                 self._try_parse_meas_line(line)
 
         # Also try parsing multi-line .meas results format
         self._parse_meas_block()
 
     def _try_parse_meas_line(self, line: str):
+        # Skip lines that are obviously not measurements
+        if line.startswith(".") or line.startswith("Files loaded:"):
+            return
+
+        # print(f"Trying to parse meas line: {line}")
         if ":" in line and "\t" in line:
             parts = line.split("\t")
             if len(parts) >= 2:
                 name = parts[0].strip().rstrip(":")
                 try:
                     self.measurements[name] = float(parts[1].strip())
+                    # print(f"Found meas (tab): {name}={self.measurements[name]}")
+                    return
                 except ValueError:
                     pass
-        elif "=" in line and not line.startswith("."):
+        
+        # Handle "vpeak: MAX(V(out))=0.862229824066 FROM 0 TO 0.002"
+        if ":" in line and "=" in line:
+            parts = line.split(":", 1)
+            name = parts[0].strip()
+            # Basic validation: name should not contain spaces if it's a meas name
+            if " " in name:
+                return
+            rest = parts[1].strip()
+            if "=" in rest:
+                val_part = rest.split("=", 1)[1].strip()
+                try:
+                    self.measurements[name] = float(val_part.split()[0])
+                    return
+                except (ValueError, IndexError):
+                    pass
+
+        if "=" in line and not line.startswith("."):
             for sep in [":\t", ":\t\t", "="]:
                 if sep in line:
                     parts = line.split(sep, 1)
                     name = parts[0].strip()
+                    if " " in name or not name:
+                        continue
                     val_str = parts[1].strip()
                     try:
                         self.measurements[name] = float(val_str.split()[0])
-                    except ValueError:
+                        return
+                    except (ValueError, IndexError):
                         pass
                     break
 
@@ -188,21 +220,39 @@ class SimulationResult:
                     continue
                 data = self.raw.values.get(name)
                 if data is not None and len(data) > 0:
-                    peak = float(np.max(np.abs(data)))
-                    mean = float(np.mean(data))
-                    rms = float(np.sqrt(np.mean(data ** 2)))
-                    lines.append(f"  {name}: peak={peak:.4e}, mean={mean:.4e}, rms={rms:.4e}")
+                    try:
+                        # Use NaN-safe functions to prevent crashes on simulation blowup
+                        peak = float(np.nanmax(np.abs(data)))
+                        mean = float(np.nanmean(data))
+                        # For RMS, we handle NaN/Inf by checking if the result is valid
+                        ms = np.nanmean(data ** 2)
+                        rms = float(np.sqrt(ms)) if ms >= 0 else 0.0
+                        
+                        # Format with fallback for NaN/Inf values
+                        p_str = f"{peak:.4e}" if np.isfinite(peak) else "NaN"
+                        m_str = f"{mean:.4e}" if np.isfinite(mean) else "NaN"
+                        r_str = f"{rms:.4e}" if np.isfinite(rms) else "NaN"
+                        
+                        lines.append(f"  {name}: peak={p_str}, mean={m_str}, rms={r_str}")
+                    except Exception:
+                        lines.append(f"  {name}: (calculation error)")
 
         return "\n".join(lines)
 
     def to_dict(self, include_data: bool = True) -> Dict[str, Any]:
+        import math
+        def _json_safe(v):
+            if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+                return None
+            return v
+
         d: Dict[str, Any] = {
             "successful": self.successful,
             "returncode": self.returncode,
             "plotname": self.raw.plotname if self.raw else "",
             "num_variables": self.raw.num_variables if self.raw else 0,
             "num_points": self.raw.num_points if self.raw else 0,
-            "measurements": dict(self.measurements),
+            "measurements": {k: _json_safe(v) for k, v in self.measurements.items()},
             "solver": self.solver,
             "method": self.method,
             "tnom": self.tnom,
@@ -214,7 +264,8 @@ class SimulationResult:
         if self.raw:
             d["variables"] = [{"name": v["name"], "unit": v.get("unit", "")} for v in self.raw.variables]
             if include_data:
-                d["data"] = {k: v.tolist() for k, v in self.raw.values.items()}
+                # Sanitize entire data arrays for JSON
+                d["data"] = {k: [(_json_safe(float(x))) for x in v] for k, v in self.raw.values.items()}
         return d
 
     def measurement(self, name: str, func: str, expression: str) -> "SimulationResult":
