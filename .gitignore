@@ -1,0 +1,27 @@
+# Environment
+.env
+
+# Simulation artifacts
+*.raw
+*.log
+*.net
+workdir/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
