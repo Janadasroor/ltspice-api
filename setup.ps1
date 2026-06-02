@@ -46,9 +46,13 @@ Write-Host "Python: $($py.Source)" -ForegroundColor Green
 $req = Join-Path $PSScriptRoot "requirements.txt"
 if (Test-Path $req) {
     Write-Host "Installing dependencies..." -ForegroundColor Yellow
-    python -m pip install -r $req
+    $pipOutput = python -m pip install -r $req 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: pip install failed" -ForegroundColor Red
+        Write-Host $pipOutput -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Try installing manually:" -ForegroundColor Yellow
+        Write-Host "  python -m pip install fastapi uvicorn numpy pywin32 python-telegram-bot matplotlib" -ForegroundColor Gray
         exit 1
     }
 }
