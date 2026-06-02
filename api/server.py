@@ -231,6 +231,28 @@ async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/help")
+async def help():
+    return {
+        "endpoints": {
+            "GET /health": "Server status",
+            "GET /help": "This help message",
+            "POST /netlist": "Generate SPICE netlist from component definition",
+            "POST /simulate": "Run simulation from netlist text",
+            "POST /circuit": "Run simulation from component definition",
+            "GET /results/{sim_id}": "Simulation metadata",
+            "GET /results/{sim_id}/summary": "Formatted simulation summary",
+            "GET /results/{sim_id}/data?var=X": "Signal data for variable X",
+            "GET /results/{sim_id}/fft?var=X": "FFT analysis for variable X",
+            "GET /results/{sim_id}/measurements": ".meas measurement values",
+            "GET /results/{sim_id}/log": "Raw LTspice log",
+            "GET /results/{sim_id}/netlist": "Original netlist",
+            "DELETE /results/{sim_id}": "Free server resources",
+            "GET /telegram/status": "Telegram bot status",
+        }
+    }
+
+
 @app.post("/netlist", response_class=PlainTextResponse)
 async def netlist_from_circuit(defn: CircuitDef):
     cir = _build_circuit(defn)
